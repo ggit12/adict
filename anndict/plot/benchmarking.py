@@ -1,366 +1,20 @@
-#stablelabel pipeline--an experimental pipeline to perform error correct on celltype annotations
-import numpy as np
-from sklearn.base import clone
-from sklearn.metrics import accuracy_score
-from sklearn.utils.validation import check_random_state
-from sklearn.preprocessing import LabelEncoder
-import scanpy as sc
-import anndata as ad
+"""
+This module makes plots of the results of benchmarking (i.e. if you already have a ground truth label column in your dataset, and want to compare predictions).
+"""
 import os
-import re
-import pandas as pd
-import random
-import itertools
-from IPython.display import HTML, display
+from collections import defaultdict
 
-from sklearn.decomposition import PCA
-from scipy.stats import gaussian_kde
+import numpy as np
+import pandas as pd
 from scipy.optimize import linear_sum_assignment
+from sklearn.metrics import confusion_matrix
+from sklearn.preprocessing import LabelEncoder
 
 import seaborn as sns
-import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-from sklearn.metrics import confusion_matrix
 
-
-from sklearn.metrics import cohen_kappa_score
-from statsmodels.stats.inter_rater import fleiss_kappa
-import krippendorff
-
-
-import harmonypy as hm
-
-from .utils import create_color_map, add_label_to_adata
-
-def get_slurm_cores():
-    """
-    Returns the total number of CPU cores allocated to a Slurm job based on environment variables.
-    """
-    # Get the number of CPUs per task (default to 1 if not set)
-    cpus_per_task = int(os.getenv('SLURM_CPUS_PER_TASK', 1))
-    
-    # Get the number of tasks (default to 1 if not set)
-    ntasks = int(os.getenv('SLURM_NTASKS', 1))
-    
-    # Calculate total cores
-    total_cores = cpus_per_task * ntasks
-    
-    return total_cores
-
-def pca_density_filter(data, n_components=3, threshold=0.10):
-    """
-    Calculate density contours for PCA-reduced data, return the density of all input data,
-    and identify the unique variables that were included in the PCA.
-
-    Parameters:
-    - data: array-like, shape (n_samples, n_features)
-    - n_components: int, number of components for PCA to reduce the data to.
-
-    Returns:
-    - pca_data: PCA-reduced data (None if all variables are constant).
-    - density: Density values of all the points (None if all variables are constant).
-    - unique_variables: List of unique variables that were included in the PCA (empty list if all variables are constant).
-    """
-
-    # Check for constant variables (these will not be used by PCA)
-    non_constant_columns = np.var(data, axis=0) > 0
-    
-    # Skip the block if no non-constant variables are found
-    if not np.any(non_constant_columns):
-        return None, None, []
-
-	# Adjust n_components if necessary
-    n_features = np.sum(non_constant_columns)
-    n_samples = data.shape[0]
-    n_components = min(n_components, n_features, n_samples)
-        
-    unique_variables = np.arange(data.shape[1])[non_constant_columns]
-
-    # Perform PCA reduction only on non-constant variables
-    pca = PCA(n_components=n_components)
-    pca_data = pca.fit_transform(data[:, non_constant_columns])
-
-    # Calculate the point density for all points
-    kde = gaussian_kde(pca_data.T)
-    density = kde(pca_data.T)
-
-    # Determine the density threshold
-    cutoff = np.percentile(density, threshold * 100)
-
-    return density, cutoff, unique_variables.tolist()
-
-def pca_density_wrapper(X, labels):
-    """
-    Apply calculate_density_contours_with_unique_variables to subsets of X indicated by labels.
-    Returns a vector indicating whether each row in X is above the threshold for its respective label group.
-    
-    Parameters:
-    - X: array-like, shape (n_samples, n_features)
-    - labels: array-like, shape (n_samples,), labels indicating the subset to which each row belongs
-    
-    Returns:
-    - index_vector: array-like, boolean vector of length n_samples indicating rows above the threshold
-    """
-    unique_labels = np.unique(labels)
-    index_vector = np.zeros(len(X), dtype=bool)
-    
-    for label in unique_labels:
-        subset = X[labels == label]
-        if subset.shape[0] < 10:
-            # If fewer than 10 cells, include all cells by assigning density = 1 and cutoff = 0
-            density, cutoff = np.ones(subset.shape[0]), 0
-        else:
-            density, cutoff, _ = pca_density_filter(subset, n_components=3, threshold=0.10)
-        
-        # Mark rows above the threshold for this label
-        high_density_indices = density > cutoff
-        global_indices = np.where(labels == label)[0][high_density_indices]
-        index_vector[global_indices] = True
-    
-    return index_vector
-
-# def pca_density_adata_dict(adata_dict, keys):
-#     """
-#     This function applies PCA-based density filtering to the AnnData objects within adata_dict.
-#     If adata_dict contains only one key, the filtering is applied directly. If there are multiple keys,
-#     it recursively builds new adata dictionaries for subsets based on the provided keys and applies
-#     the filtering to these subsets. Finally, it concatenates the results back into a single AnnData object.
-    
-#     Parameters:
-#     - adata_dict: Dictionary of AnnData objects, with keys indicating different groups.
-#     - keys: List of keys to stratify the AnnData objects further if more than one group is present.
-    
-#     Returns:
-#     - AnnData object containing the results of PCA density filtering applied to each subset,
-#       with results combined if the initial dictionary had more than one key.
-#     """
-#     if len(adata_dict) == 1:
-#         # Only one group in adata_dict, apply density filter directly
-#         label, adata = next(iter(adata_dict.items()))
-#         X = adata.X
-#         if X.shape[0] < 10:
-#             density, cutoff = np.ones(X.shape[0]), 0
-#         else:
-#             density, cutoff, _ = pca_density_filter(X, n_components=3, threshold=0.10)
-#         high_density_indices = density > cutoff
-#         index_vector = np.zeros(X.shape[0], dtype=bool)
-#         index_vector[high_density_indices] = True
-#         add_label_to_adata(adata, np.arange(X.shape[0]), index_vector, 'density_filter')
-#         return adata
-#     else:
-#         # More than one group, handle recursively
-#         first_key = keys[0]
-#         new_keys = keys[1:]
-#         updated_adatas = {}
-#         for key, group_adata in adata_dict.items():
-#             new_adata_dict = build_adata_dict(group_adata, new_keys, {k: group_adata.obs[k].unique().tolist() for k in new_keys})
-#             updated_adatas[key] = pca_density_wrapper(new_adata_dict, new_keys)
-#         return concatenate_adata_dict(updated_adatas)
-    
-def pca_density_adata_dict(adata_dict, keys):
-    """
-    Applies PCA-based density filtering recursively on subsets of an AnnData dictionary. Each subset
-    is determined by the provided keys. The function returns a dictionary where each AnnData object
-    has an additional metadata key indicating the result of the density filter. The structure of the
-    input dictionary is preserved, and each AnnData object's metadata is updated in-place.
-
-    Parameters:
-    - adata_dict: Dictionary of AnnData objects, with keys indicating different groups.
-    - keys: List of keys to further stratify the AnnData objects if recursion is needed.
-
-    Returns:
-    - Dictionary: Updated adata_dict with the same keys but with each AnnData object having a new metadata key 'density_filter'.
-    """
-    from .dict import build_adata_dict, concatenate_adata_dict
-    if len(keys) == 0:
-        # No further keys to split by, apply filtering directly
-        for label, adata in adata_dict.items():
-            X = adata.X
-            if X.shape[0] < 10:
-                density, cutoff = np.ones(X.shape[0]), 0
-            else:
-                density, cutoff, _ = pca_density_filter(X, n_components=3, threshold=0.10)
-            high_density_indices = density > cutoff
-            index_vector = np.zeros(X.shape[0], dtype=bool)
-            index_vector[high_density_indices] = True
-            add_label_to_adata(adata, np.arange(X.shape[0]), index_vector, 'density_filter')
-    else:
-        # Recurse into further keys
-        first_key = keys[0]
-        new_keys = keys[1:]
-        for label, adata in adata_dict.items():
-            subgroups = build_adata_dict(adata, [first_key], {first_key: adata.obs[first_key].unique().tolist()})
-            pca_density_wrapper(subgroups, new_keys)  # Recursively update each subgroup
-            # Combine results back into the original adata entry
-            updated_adata = concatenate_adata_dict(subgroups)
-            adata_dict[label] = updated_adata
-
-    return adata_dict
-
-
-
-def stable_label(X, y, classifier, max_iterations=100, stability_threshold=0.05, moving_average_length=3, random_state=None):
-    """
-    Trains a classifier using a semi-supervised approach where labels are probabilistically reassigned based on classifier predictions.
-    
-    Parameters:
-    - X: ndarray, feature matrix.
-    - y: ndarray, initial labels for all data.
-    - classifier: a classifier instance that implements fit and predict_proba methods.
-    - max_iterations: int, maximum number of iterations for updating labels.
-    - stability_threshold: float, threshold for the fraction of labels changing to consider the labeling stable.
-    - moving_average_length: int, number of past iterations to consider for moving average.
-    - random_state: int or None, seed for random number generator for reproducibility.
-    
-    Returns:
-    - classifier: trained classifier.
-    - history: list, percentage of labels that changed at each iteration.
-    - iterations: int, number of iterations run.
-    - final_labels: ndarray, the labels after the last iteration.
-    """
-    rng = check_random_state(random_state)
-    history = []
-    current_labels = y.copy()
-    
-    for iteration in range(max_iterations):
-
-        #Call the wrapper function to get the index vector
-        dense_on_pca = pca_density_wrapper(X, current_labels)
-
-        #Get which labels are non_empty
-        has_label = current_labels != -1
-
-        #Train the classifier on cells that are dense in pca space and have labels
-        mask = dense_on_pca & has_label
-        classifier.fit(X[mask], current_labels[mask])
-        
-        # Predict label probabilities
-        probabilities = classifier.predict_proba(X)
-
-        #view some predicted probabilities for rows of X
-        # print("Sample predicted probabilities for rows of X:", probabilities[:5])
-        
-        # Sample new labels from the predicted probabilities
-        new_labels = np.array([np.argmax(prob) if max(prob) > 0.8 else current_labels[i] for i, prob in enumerate(probabilities)])
-        # new_labels = np.array([np.argmax(prob) for i, prob in enumerate(probabilities)])
-
-        # def transform_row(row, p):
-        #     """
-        #     Transform an array by raising each element to the power of p and then normalizing these values
-        #     so that their sum is 1.
-
-        #     Parameters:
-        #     row (np.array): The input array to be transformed.
-        #     p (float): The power to which each element of the array is raised.
-
-        #     Returns:
-        #     np.array: An array where each element is raised to the power of p and
-        #             normalized so that the sum of all elements is 1.
-        #     """
-        #     row = np.array(row)  # Ensure input is a numpy array
-        #     powered_row = np.power(row, p)  # Raise each element to the power p
-        #     normalized_row = powered_row / np.sum(powered_row)  # Normalize the powered values
-        #     return normalized_row
-        
-        # new_labels = np.array([np.random.choice(len(row), p=transform_row(row, 4)) for row in probabilities])
-
-        #randomly flip row label with probability given by confidence in assignment--hopefully prevents "cell type takeover"
-        # def random_bool(p):
-        #     weights = [p, 1-p]
-        #     weights = [w**2 for w in weights]
-        #     weights = [w/sum(weights) for w in weights]
-        #     return random.choices([False, True], weights=weights, k=1)[0]
-
-        # new_labels = np.array([np.random.choice(len(row)) if random_bool(max(row)) else current_labels[i] for i, row in enumerate(probabilities)])
-        
-        # Determine the percentage of labels that changed
-        changes = np.mean(new_labels != current_labels)
-
-        # Record the percentage of labels that changed
-        history.append(changes)
-        
-        # Compute moving average of label changes over the last n iterations
-        if len(history) >= moving_average_length:
-            moving_average = np.mean(history[-moving_average_length:])
-            if moving_average < stability_threshold:
-                break
-
-        #update current labels
-        current_labels = new_labels
-
-        if len(np.unique(current_labels)) == 1:
-            print("converged to single label.")
-            break
-
-    return classifier, history, iteration + 1, current_labels
-
-def stable_label_adata(adata, feature_key, label_key, classifier, max_iterations=100, stability_threshold=0.05, moving_average_length=3, random_state=None):
-    """
-    A wrapper for train_classifier_with_probabilistic_labels that handles categorical labels.
-
-    Parameters:
-    - adata: AnnData object containing the dataset.
-    - feature_key: str, key to access the features in adata.obsm.
-    - label_key: str, key to access the labels in adata.obs.
-    - classifier: classifier instance that implements fit and predict_proba methods.
-    - max_iterations, stability_threshold, moving_average_length, random_state: passed directly to train_classifier_with_probabilistic_labels.
-
-    Returns:
-    - classifier: trained classifier.
-    - history: list, percentage of labels that changed at each iteration.
-    - iterations: int, number of iterations run.
-    - final_labels: ndarray, text-based final labels after the last iteration.
-    - label_encoder: the label encoder used during training (can be used to convert predictions to semantic labels)
-    """
-    # Initialize Label Encoder
-    label_encoder = LabelEncoder()
-    
-    # Extract features and labels from adata
-    X = adata.obsm[feature_key]
-    y = adata.obs[label_key].values
-
-    # Define a list of values to treat as missing
-    missing_values = set(['missing', 'unannotated', '', 'NA'])
-
-    # Replace defined missing values with np.nan
-    y = np.array([np.nan if item in missing_values or pd.isna(item) else item for item in y])
-
-    # Encode categorical labels to integers
-    encoded_labels = label_encoder.fit_transform(y)
-
-    # Map np.nan's encoding index to -1
-    if np.nan in label_encoder.classes_:
-        nan_label_index = label_encoder.transform([np.nan])[0]
-        encoded_labels[encoded_labels == nan_label_index] = -1
-    
-    # Train the classifier using the modified training function that handles probabilistic labels
-    trained_classifier, history, iterations, final_numeric_labels = stable_label(
-        X, encoded_labels, classifier, max_iterations, stability_threshold, moving_average_length, random_state
-    )
-    
-    # Decode the numeric labels back to original text labels
-    final_labels = label_encoder.inverse_transform(final_numeric_labels)
-    
-    return trained_classifier, history, iterations, final_labels, label_encoder
-
-
-def update_adata_labels_with_results(adata, results, new_label_key='stable_cell_type'):
-    """
-    Collects indices and labels from results and adds them to the AnnData object using add_label_to_adata function.
-
-    Parameters:
-    - adata: AnnData object to be updated.
-    - results: Dictionary containing results, including indices and final_labels.
-    - new_label_key: Name of the new column in adata.obs where the labels will be stored.
-    """
-    # Collect all indices and labels from the results
-    all_indices = np.concatenate([info['indices'] for stratum, info in results.items()])
-    all_labels = np.concatenate([info['final_labels'] for stratum, info in results.items()])
-
-    # Call the function to add labels to adata
-    add_label_to_adata(adata, all_indices, all_labels, new_label_key)
-
+from anndict.utils import create_color_map
 
 def plot_training_history(results, separate=True):
     """
@@ -392,31 +46,6 @@ def plot_training_history(results, separate=True):
         plt.grid(True)
         plt.legend()
         plt.show()
-
-# def plot_changes(adata, true_label_key, predicted_label_key, percentage=True, stratum=None):
-#     # Extract the series from the AnnData object's DataFrame
-#     data = adata.obs[[predicted_label_key, true_label_key]].copy()
-    
-#     # Add a mismatch column that checks whether the predicted and true labels are different
-#     data['Changed'] = data[true_label_key] != data[predicted_label_key]
-    
-#     # Group by predicted label key and calculate the sum of mismatches or the mean if percentage
-#     if percentage:
-#         change_summary = data.groupby(true_label_key)['Changed'].mean()
-#     else:
-#         change_summary = data.groupby(true_label_key)['Changed'].sum()
-    
-#     # Sort the summary in descending order
-#     change_summary = change_summary.sort_values(ascending=False)
-    
-#     # Plotting
-#     ax = change_summary.plot(kind='bar', color='red', figsize=(10, 6))
-#     ax.set_xlabel(true_label_key)
-#     ax.set_ylabel('Percentage of Labels Changed' if percentage else 'Count of Labels Changed')
-#     ax.set_title(stratum)
-#     ax.set_xticklabels(change_summary.index, rotation=90)
-#     plt.xticks(fontsize=8)
-#     plt.show()
 
 def plot_changes(adata, true_label_key, predicted_label_key, percentage=True, stratum=None):
     """
@@ -529,12 +158,42 @@ def plot_confusion_matrix(true_labels_encoded, predicted_labels_encoded, label_e
                           true_label_color_dict=None, predicted_label_color_dict=None,
                           true_labels=None, predicted_labels=None, figsize=None,
                           diagonalize=False, true_ticklabels=None, predicted_ticklabels=None, annot=None):
+    """
+    Plots a normalized confusion matrix with optional auto-diagonalization, clustering, and color annotations.
+
+    Parameters:
+        true_labels_encoded (array-like): Encoded true labels of the data.
+        predicted_labels_encoded (array-like): Encoded predicted labels of the data.
+        label_encoder (LabelEncoder): A fitted label encoder used to decode the labels.
+        color_map (dict): A nested dictionary specifying colors for keys used in annotations.
+        title (str, optional): Title for the plot. Default is 'Confusion Matrix'.
+        row_color_keys (list of str, optional): Keys from `color_map` to apply to rows based on `true_labels`.
+        col_color_keys (list of str, optional): Keys from `color_map` to apply to columns based on `predicted_labels`.
+        true_label_color_dict (dict, optional): Mapping of true labels to color information.
+        predicted_label_color_dict (dict, optional): Mapping of predicted labels to color information.
+        true_labels (array-like, optional): Original true labels (used for mapping row colors).
+        predicted_labels (array-like, optional): Original predicted labels (used for mapping column colors).
+        figsize (tuple, optional): Dimensions of the figure (width, height) in inches.
+        diagonalize (bool, optional): If True, reorders the confusion matrix to make it as diagonal as possible. Default is False.
+        true_ticklabels (list, optional): Custom tick labels for the true labels axis. Defaults to automatic handling.
+        predicted_ticklabels (list, optional): Custom tick labels for the predicted labels axis. Defaults to automatic handling.
+        annot (bool, optional): Whether to annotate the confusion matrix cells. Defaults to True for small matrices.
+
+    Returns:
+        sns.ClusterGrid: A seaborn ClusterGrid object representing the confusion matrix.
+
+    Notes:
+        - If the number of true or predicted labels exceeds 40, tick labels and annotations are disabled by default for better visibility.
+        - Color annotations (row and column colors) are only applied if `row_color_keys` or `col_color_keys` are provided.
+        - If `diagonalize` is True, the matrix is reordered using linear sum assignment to maximize diagonal dominance.
+    """
+
     labels_true = np.unique(true_labels_encoded)
     labels_pred = np.unique(predicted_labels_encoded)
-    
+
     # Compute the confusion matrix
     cm = confusion_matrix(true_labels_encoded, predicted_labels_encoded, labels=np.arange(len(label_encoder.classes_)))
-    
+
     # Normalize the confusion matrix by row (i.e., by the number of samples in each class)
     cm_normalized = cm.astype('float') / cm.sum(axis=1, keepdims=True)
     cm_normalized = pd.DataFrame(cm_normalized[np.ix_(labels_true, labels_pred)], 
@@ -549,7 +208,7 @@ def plot_confusion_matrix(true_labels_encoded, predicted_labels_encoded, label_e
         # Concatenate the optimal indices with the non-optimal ones
         row_ind = np.concatenate((row_ind, np.setdiff1d(np.arange(cm_normalized.shape[0]), row_ind)))
         col_ind = np.concatenate((col_ind, np.setdiff1d(np.arange(cm_normalized.shape[1]), col_ind)))
-        
+
         cm_normalized = cm_normalized.iloc[row_ind, col_ind]
         labels_true_sorted = label_encoder.inverse_transform(labels_true)[row_ind]
         labels_pred_sorted = label_encoder.inverse_transform(labels_pred)[col_ind]
@@ -569,7 +228,7 @@ def plot_confusion_matrix(true_labels_encoded, predicted_labels_encoded, label_e
     if row_color_keys:
         row_colors = map_labels_to_colors(labels_true_sorted, true_label_color_dict, color_map)
         row_colors = pd.DataFrame(row_colors, index=labels_true_sorted)
-    
+
     col_colors = None
     if col_color_keys:
         col_colors = map_labels_to_colors(labels_pred_sorted, predicted_label_color_dict, color_map)
@@ -593,9 +252,41 @@ def plot_confusion_matrix(true_labels_encoded, predicted_labels_encoded, label_e
     return g
 
 def plot_sankey(adata, cols, params=None):
+    """
+    Generate a Sankey diagram from the specified columns in the `adata.obs` DataFrame.
 
+    Parameters:
+        adata : AnnData
+            An AnnData object containing the observation data (`adata.obs`) to be visualized.
+        cols : list of str
+            A list of column names from `adata.obs` that define the nodes and flow relationships for the Sankey diagram.
+        params : dict, optional
+            A dictionary of optional parameters to customize the Sankey diagram appearance. Supported keys include:
+                - 'cmap': str, colormap for node colors (default: 'Colorblind').
+                - 'label_position': str, position of node labels ('outer' or 'center', default: 'outer').
+                - 'edge_line_width': int, width of the edges (default: 0).
+                - 'edge_color': str, attribute for edge coloring (default: 'value', or 'grey' for uniform color).
+                - 'show_values': bool, whether to display flow values (default: False).
+                - 'node_padding': int, padding between nodes (default: 12).
+                - 'node_alpha': float, transparency of nodes (default: 1.0).
+                - 'node_width': int, width of nodes (default: 30).
+                - 'node_sort': bool, whether to sort nodes (default: True).
+                - 'frame_height': int, height of the diagram frame (default: 1000).
+                - 'frame_width': int, width of the diagram frame (default: 2000).
+                - 'bgcolor': str, background color of the diagram (default: 'white').
+                - 'apply_ranges': bool, whether to apply range adjustments to the plot (default: True).
+                - 'align_thr': float, alignment threshold for colors (default: -0.1).
+                - 'label_font_size': str, font size for labels (default: '12pt').
+
+    Returns:
+        hv.Sankey
+            A Holoviews Sankey diagram object configured based on the input data and parameters.
+
+    Example:
+        sankey = plot_sankey(adata, cols=['column1', 'column2', 'column3'], params={'cmap': 'viridis', 'frame_width': 1200})
+        hv.save(sankey, 'sankey_diagram.html')
+    """
     import holoviews as hv
-    from collections import defaultdict
     hv.extension('bokeh')
 
     def f(plot, element):
@@ -606,9 +297,9 @@ def plot_sankey(adata, cols, params=None):
 
     if params is None:
         params = {}
-    
+
     obs = adata.obs[cols]
-    
+
     # Creating unique labels for each column
     unique_labels = []
     label_dict = defaultdict(dict)
@@ -619,7 +310,7 @@ def plot_sankey(adata, cols, params=None):
                 unique_label = f"{item} ({col})"
                 label_dict[col_index][item] = unique_label
                 unique_labels.append(unique_label)
-    
+
     # Creating source, target and value lists
     source = []
     target = []
@@ -632,14 +323,14 @@ def plot_sankey(adata, cols, params=None):
             source.append(label_dict[i][a])
             target.append(label_dict[i+1][b])
             value.append(v)
-    
+
     # Creating DataFrame for Sankey
     sankey_data = pd.DataFrame({
         'source': source,
         'target': target,
         'value': value
     })
-    
+
     # Appearance parameters
     cmap = params.get('cmap', 'Colorblind')
     label_position = params.get('label_position', 'outer')
@@ -659,18 +350,18 @@ def plot_sankey(adata, cols, params=None):
 
     colormap_max = max(sankey_data['value'])
     norm = plt.Normalize(vmin=0, vmax=colormap_max)
-    colors = plt.cm.plasma(norm(np.linspace(0, colormap_max, 128)))
-    
+    colors = plt.cm.get_cmap("plasma")(norm(np.linspace(0, colormap_max, 128)))
+
     replace_these = np.where(norm(np.linspace(0, colormap_max, 128)) <= align_thr)[0]
     if replace_these.size > 0:
         colors[replace_these] = [[1, 1, 1, 0] for _ in range(len(replace_these))]
-    
+
     edge_cmap = mcolors.LinearSegmentedColormap.from_list('my_colormap', colors)
-    
+
     if edge_color == "grey":
         # edge_color = "grey"  # Set edge_color to grey
         edge_cmap = None  # No colormap for grey edges
-    
+
     sankey = hv.Sankey(sankey_data, kdims=["source", "target"], vdims=["value"])
     sankey = sankey.opts(
         cmap=cmap, label_position=label_position, edge_color=edge_color, edge_cmap=edge_cmap, colorbar=True if edge_cmap else False,
@@ -709,6 +400,7 @@ def save_sankey(plot, filename, adt_key=None):
 
     export_svgs(plot, filename=filename)
 
+
 def plot_grouped_average(adata, label_value, adt_key=None):
     """
     Plots the average values specified in label_value across each group of label_keys in an AnnData object.
@@ -734,13 +426,14 @@ def plot_grouped_average(adata, label_value, adt_key=None):
     df = pd.DataFrame(grouped_means)
     
     # Plot the results
-    df.plot(kind='bar', figsize=(12, 8), color=plt.cm.Paired.colors)
+    df.plot(kind='bar', figsize=(12, 8), color=plt.cm.get_cmap("Paired").colors)
     plt.xlabel('Groups')
     plt.ylabel('Average Scores')
     plt.title('Average Scores across Groups')
     plt.xticks(rotation=90)
     plt.legend(title='Scores')
     plt.show()
+
 
 def plot_model_agreement(adata, group_by, sub_group_by, model_cols, granularity=2):
     """
@@ -767,13 +460,13 @@ def plot_model_agreement(adata, group_by, sub_group_by, model_cols, granularity=
     if granularity == 0:
         # Calculate the average scores across all groups within each model
         grouped_means = melted.groupby('model_name')['agreement'].mean().sort_values(ascending=False)
-        
+
         # Create figure and axis objects
         fig, ax = plt.subplots(figsize=(14, 8))
-        
+
         # Plot the bar chart
         grouped_means.plot(kind='bar', ax=ax, colormap='Paired')
-        
+
         # Add value labels on top of each bar
         for i, v in enumerate(grouped_means):
             ax.text(i, v, f'{v * 100:.0f}%', ha='center', va='bottom')
@@ -781,21 +474,20 @@ def plot_model_agreement(adata, group_by, sub_group_by, model_cols, granularity=
     elif granularity == 1:
         # Calculate the average scores within each model and cell type
         grouped_means = melted.groupby([group_by, 'model_name'])['agreement'].mean().unstack()
-        grouped_means = grouped_means  # No model_order sorting in this version
-        
+
         fig, ax = plt.subplots(figsize=(14, 8))
         grouped_means.plot(kind='bar', ax=ax, colormap='Paired')
 
     elif granularity == 2:
         # Calculate the average scores within each model, cell type, and tissue
         grouped_means = melted.groupby([group_by, sub_group_by, 'model_name'])['agreement'].mean().unstack(level=[1, 2])
-        
+
         # Ensure the data is numeric and allow NaNs (missing values)
         grouped_means = grouped_means.apply(pd.to_numeric, errors='coerce')
-        
+
         # Create a mask for NaN values
         mask = grouped_means.isnull()
-        
+
         # Create a color mapping for tissues using the provided colors
         tissue_colors = [
             "#1f77b4", "#aec7e8", "#ff7f0e", "#ffbb78",
@@ -859,13 +551,13 @@ def plot_model_agreement(adata, group_by, sub_group_by, model_cols, granularity=
             ax.axvline(pos, color='black', linewidth=0.5)
 
         return g
-        
+
         # Create a legend for tissues
         # tissue_handles = [plt.Rectangle((0,0),1,1, color=color) for color in tissue_color_map.values()]
         # ax.legend(tissue_handles, tissue_color_map.keys(), title=sub_group_by, 
         #           loc='center left', bbox_to_anchor=(1, 0.5))
         # return fig, ax
-        
+
     else:
         raise ValueError("Granularity must be 0, 1, or 2.")
 
@@ -882,9 +574,9 @@ def plot_model_agreement(adata, group_by, sub_group_by, model_cols, granularity=
     elif granularity == 2:
         title += f' by {group_by} and {sub_group_by}'
     ax.set_title(title)
-    
+
     ax.set_xticklabels(ax.get_xticklabels(), rotation=90, ha='center')
-    
+
     if granularity < 2:
         ax.legend(title='Models' + ('' if granularity == 0 else ' and Tissues'))
 
@@ -903,10 +595,6 @@ def plot_model_agreement_categorical(adata, group_by, sub_group_by, model_cols, 
     - model_cols: list of str, column names for the models (e.g., ['model_1', 'model_2']). These should be categorical.
     - granularity: int, level of detail in the plot (0 = models only, 1 = models within cell types, 2 = models within cell types and tissues).
     """
-    import pandas as pd
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-
     # Verify that the required columns exist
     if not all(col in adata.obs for col in model_cols):
         missing_cols = [col for col in model_cols if col not in adata.obs]
@@ -1074,133 +762,3 @@ def plot_model_agreement_categorical(adata, group_by, sub_group_by, model_cols, 
 
     else:
         raise ValueError("Granularity must be 0, 1, or 2.")
-
-def kappa_adata(adata, cols):
-    """
-    Calculate pairwise Cohen's Kappa, average pairwise Kappa, and Fleiss' Kappa
-    for categorical data in adata.obs[cols].
-    Parameters:
-    - adata: AnnData object.
-    - cols: List of columns in adata.obs to use for calculating agreement.
-    Returns:
-    - Dictionary with keys 'pairwise', 'average_pairwise', and 'fleiss':
-    - 'pairwise': A dictionary with pairwise Cohen's Kappa values.
-    - 'average_pairwise': A dictionary with the average pairwise Kappa for each rater.
-    - 'fleiss': The Fleiss' Kappa value for the overall agreement across all raters.
-    """
-    # Extract data from adata.obs based on the specified columns
-    data = adata.obs[cols].to_numpy()
-    num_raters = len(cols)
-    kappa_scores = {'pairwise': {}, 'average_pairwise': {}, 'fleiss': None}
-
-    # Calculate pairwise Cohen's Kappa
-    for i in range(num_raters):
-        rater_kappas = []
-        for j in range(num_raters):
-            if i != j:
-                # Calculate Cohen's Kappa for each pair
-                kappa = cohen_kappa_score(data[:, i], data[:, j])
-                kappa_scores['pairwise'][(cols[i], cols[j])] = kappa
-                rater_kappas.append(kappa)
-        
-        # Average Kappa for this rater (with every other rater)
-        avg_kappa = np.mean(rater_kappas) if rater_kappas else None
-        kappa_scores['average_pairwise'][cols[i]] = avg_kappa
-
-    # Fleiss' Kappa calculation
-    unique_categories = np.unique(data)
-    category_map = {cat: idx for idx, cat in enumerate(unique_categories)}
-    fleiss_data = np.zeros((data.shape[0], len(unique_categories)))
-
-    # Count category occurrences per item (per row) using vectorized operations
-    for i in range(data.shape[0]):
-        row = np.array([category_map[val] for val in data[i]])
-        fleiss_data[i] = np.bincount(row, minlength=len(unique_categories))
-
-    # Calculate Fleiss' Kappa
-    fleiss_kappa_value = fleiss_kappa(fleiss_data)
-    kappa_scores['fleiss'] = fleiss_kappa_value
-
-    return kappa_scores
-
-
-def krippendorff_alpha_adata(adata, cols, level_of_measurement='nominal'):
-    """
-    Calculate Krippendorff's Alpha for categorical data in adata.obs[cols].
-    Parameters:
-    - adata: AnnData object.
-    - cols: List of columns in adata.obs to use for calculating agreement.
-    - level_of_measurement: The type of data ('nominal', 'ordinal', 'interval', 'ratio'). Default is 'nominal' (for categorical data).
-    Returns:
-    - Krippendorff's Alpha for the specified columns in adata.obs.
-    """
-    # Extract data from adata.obs based on the specified columns
-    data = adata.obs[cols].to_numpy()
-
-    # Initialize LabelEncoder
-    le = LabelEncoder()
-
-    # Flatten the data, fit the encoder, and reshape back
-    flat_data = data.ravel()
-    encoded_flat = le.fit_transform(flat_data)
-    encoded_data = encoded_flat.reshape(data.shape)
-
-    # Transpose the data to match Krippendorff's alpha input format
-    # (units as columns, raters as rows)
-    encoded_data = encoded_data.T
-
-    # Calculate Krippendorff's Alpha
-    alpha = krippendorff.alpha(reliability_data=encoded_data, level_of_measurement=level_of_measurement)
-    
-    return alpha
-
-
-#harmony label functions
-def harmony_label_transfer(adata_to_label, master_data, master_subset_column, label_column):
-    """
-    Perform Harmony integration and transfer labels from master_data to adata_to_label.
-
-    This function subsets master_data based on a provided column to get the cells
-    that match in the same column of adata_to_label. It then performs Harmony
-    integration on the combined dataset and transfers the specified label column
-    from master_data to adata_to_label.
-
-    Parameters:
-    adata_to_label : anndata.AnnData The AnnData object to which labels will be transferred.
-    master_data : anndata.AnnData The master AnnData object containing the reference data and labels.
-    master_subset_column : str The column name in .obs used for subsetting master_data to match adata_to_label.
-    label_column : str The column name in .obs of master_data containing the labels to be transferred.
-
-    Returns:
-    anndata.AnnData The adata_to_label object with a new column 'harmony_labels' in .obs containing the transferred labels.
-    """
-    
-    # Subset master_data based on the provided column to get matching cells
-    matching_cells = master_data.obs[master_data.obs[master_subset_column].isin(adata_to_label.obs[master_subset_column])]
-    master_subset = master_data[matching_cells.index]
-    
-    # Combine adata_to_label and the subset of master_data
-    combined_data = ad.concat([adata_to_label, master_subset])
-    
-    # Perform Harmony integration
-    sc.tl.pca(combined_data, svd_solver='arpack')
-    harmony_results = hm.run_harmony(combined_data.obsm['X_pca'], combined_data.obs, master_subset_column)
-    combined_data.obsm['X_harmony'] = harmony_results.Z_corr.T
-    
-    # Separate the integrated data back into the original datasets
-    adata_to_label_integrated = combined_data[:adata_to_label.n_obs]
-    master_integrated = combined_data[adata_to_label.n_obs:]
-    
-    # Transfer labels from master_data to adata_to_label using the integrated data
-    sc.pp.neighbors(master_integrated, use_rep='X_harmony')
-    sc.tl.umap(master_integrated)
-    sc.tl.leiden(master_integrated, resolution=0.5)
-    
-    # Transfer the specific label column from master_integrated to adata_to_label_integrated
-    master_labels = master_integrated.obs[label_column]
-    adata_to_label_integrated.obs[label_column] = master_labels.reindex(adata_to_label_integrated.obs.index).fillna(method='ffill')
-    
-    # Return adata_to_label with the new labels
-    adata_to_label.obs['harmony_labels'] = adata_to_label_integrated.obs[label_column]
-    
-    # return adata_to_label

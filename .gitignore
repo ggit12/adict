@@ -1,0 +1,10 @@
+__pycache__/
+*/__pycache__/
+
+# Ignore generated directories
+generated/
+*/generated/
+
+# macOS specific files
+.DS_Store
+
